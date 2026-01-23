@@ -15,6 +15,7 @@ OME_ARROW_TAG_VERSION = ome_arrow_version
 #  - image_type: open-ended image kind (e.g., "image", "label").
 #  - pixels_meta: pixels struct (sizes, units, channels).
 #  - planes: list of planes struct entries, one per (t,c,z).
+#  - chunk_grid/chunks: optional chunked pixels (TCZYX-aware), stored as Arrow lists.
 #  - masks: reserved for future labels/ROIs (placeholder).
 OME_ARROW_STRUCT: pa.StructType = pa.struct(
     [
@@ -68,6 +69,44 @@ OME_ARROW_STRUCT: pa.StructType = pa.struct(
                         ),
                     ),
                 ]
+            ),
+        ),
+        # CHUNK GRID: optional chunking metadata for random access.
+        #  - order: axis order for the full array, e.g., "TCZYX".
+        #  - chunk_*: chunk sizes for each axis (defaults to 1 for T/C).
+        #  - chunk_order: order used to flatten chunk pixels (default "ZYX").
+        pa.field(
+            "chunk_grid",
+            pa.struct(
+                [
+                    pa.field("order", pa.string()),
+                    pa.field("chunk_t", pa.int32()),
+                    pa.field("chunk_c", pa.int16()),
+                    pa.field("chunk_z", pa.int32()),
+                    pa.field("chunk_y", pa.int32()),
+                    pa.field("chunk_x", pa.int32()),
+                    pa.field("chunk_order", pa.string()),
+                ]
+            ),
+        ),
+        # CHUNKS: list of chunk entries (Arrow-native, no binary payloads).
+        #  - pixels flattened in chunk_order (default "ZYX").
+        pa.field(
+            "chunks",
+            pa.list_(
+                pa.struct(
+                    [
+                        pa.field("t", pa.int32()),
+                        pa.field("c", pa.int16()),
+                        pa.field("z", pa.int32()),
+                        pa.field("y", pa.int32()),
+                        pa.field("x", pa.int32()),
+                        pa.field("shape_z", pa.int32()),
+                        pa.field("shape_y", pa.int32()),
+                        pa.field("shape_x", pa.int32()),
+                        pa.field("pixels", pa.list_(pa.uint16())),
+                    ]
+                )
             ),
         ),
         # PLANES: one 2D image plane for a specific (t, c, z).

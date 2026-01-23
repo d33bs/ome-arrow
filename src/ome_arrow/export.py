@@ -21,7 +21,8 @@ def to_numpy(
     Convert an OME-Arrow record into a NumPy array shaped (T,C,Z,Y,X).
 
     The OME-Arrow "planes" are flattened YX slices indexed by (z, t, c).
-    This function reconstitutes them into a dense TCZYX ndarray.
+    When chunks are present, this function reconstitutes the dense TCZYX array
+    from chunked pixels instead of planes.
 
     Args:
         data:
@@ -58,7 +59,7 @@ def to_numpy(
     if sx <= 0 or sy <= 0 or sz <= 0 or sc <= 0 or st <= 0:
         raise ValueError("All size_* fields must be positive integers.")
 
-    expected_len = sx * sy
+    expected_plane_len = sx * sy
 
     # Prepare target array (T,C,Z,Y,X), zero-filled by default.
     out = np.zeros((st, sc, sz, sy, sx), dtype=dtype)
@@ -78,6 +79,52 @@ def to_numpy(
             a = np.clip(a, lo, hi)
         return a.astype(dtype, copy=False)
 
+    chunks = data.get("chunks") or []
+    if chunks:
+        chunk_grid = data.get("chunk_grid") or {}
+        chunk_order = str(chunk_grid.get("chunk_order") or "ZYX").upper()
+        if chunk_order != "ZYX":
+            raise ValueError("Only chunk_order='ZYX' is supported for now.")
+
+        for i, ch in enumerate(chunks):
+            t = int(ch["t"])
+            c = int(ch["c"])
+            z = int(ch["z"])
+            y = int(ch["y"])
+            x = int(ch["x"])
+            shape_z = int(ch["shape_z"])
+            shape_y = int(ch["shape_y"])
+            shape_x = int(ch["shape_x"])
+
+            if not (0 <= t < st and 0 <= c < sc and 0 <= z < sz):
+                raise ValueError(
+                    f"chunks[{i}] index out of range: (t,c,z)=({t},{c},{z})"
+                )
+            if y < 0 or x < 0 or shape_z <= 0 or shape_y <= 0 or shape_x <= 0:
+                raise ValueError(f"chunks[{i}] has invalid shape or origin.")
+
+            pix = ch["pixels"]
+            try:
+                n = len(pix)
+            except Exception as e:
+                raise ValueError(f"chunks[{i}].pixels is not a sequence") from e
+
+            expected_len = shape_z * shape_y * shape_x
+            if n != expected_len:
+                if strict:
+                    raise ValueError(
+                        f"chunks[{i}].pixels length {n} != expected {expected_len}"
+                    )
+                if n > expected_len:
+                    pix = pix[:expected_len]
+                else:
+                    pix = list(pix) + [0] * (expected_len - n)
+
+            arr3d = np.asarray(pix).reshape(shape_z, shape_y, shape_x)
+            arr3d = _cast_plane(arr3d)
+            out[t, c, z : z + shape_z, y : y + shape_y, x : x + shape_x] = arr3d
+        return out
+
     # Fill planes.
     for i, p in enumerate(data.get("planes", [])):
         z = int(p["z"])
@@ -94,16 +141,16 @@ def to_numpy(
         except Exception as e:
             raise ValueError(f"planes[{i}].pixels is not a sequence") from e
 
-        if n != expected_len:
+        if n != expected_plane_len:
             if strict:
                 raise ValueError(
-                    f"planes[{i}].pixels length {n} != size_x*size_y {expected_len}"
+                    f"planes[{i}].pixels length {n} != size_x*size_y {expected_plane_len}"
                 )
             # Lenient mode: fix length by truncation or zero-pad.
-            if n > expected_len:
-                pix = pix[:expected_len]
+            if n > expected_plane_len:
+                pix = pix[:expected_plane_len]
             else:
-                pix = list(pix) + [0] * (expected_len - n)
+                pix = list(pix) + [0] * (expected_plane_len - n)
 
         # Reshape to (Y,X) and cast.
         arr2d = np.asarray(pix).reshape(sy, sx)
@@ -255,6 +302,7 @@ def to_ome_zarr(
     - Creates level shapes for a multiscale pyramid (if multiscale_levels>1).
     - Chooses Blosc codec compatible with zarr_format (v2 vs v3).
     - Populates axes names/types/units and physical pixel sizes from pixels_meta.
+    - Uses default TCZYX chunks if none are provided.
     """
     # --- local import to avoid hard deps at module import time
     # Use the class you showed
@@ -317,6 +365,15 @@ def to_ome_zarr(
     def _down(a: int, f: int) -> int:
         return max(1, a // f)
 
+    def _default_chunks_tcxyz(
+        shape: Tuple[int, int, int, int, int],
+    ) -> Tuple[int, int, int, int, int]:
+        t, c, z, y, x = shape
+        cz = min(z, 4) if z > 1 else 1
+        cy = min(y, 512)
+        cx = min(x, 512)
+        return (1, 1, cz, cy, cx)
+
     def _level_shapes_tcxyz(levels: int) -> List[Tuple[int, int, int, int, int]]:
         shapes = [(st, sc, sz, sy, sx)]
         for _ in range(levels - 1):
@@ -340,6 +397,8 @@ def to_ome_zarr(
     # 5) Chunking / shards (can be single-shape or per-level;
     # we pass single-shape if provided)
     chunk_shape: Optional[List[Tuple[int, ...]]] = None
+    if chunks is None:
+        chunks = _default_chunks_tcxyz((st, sc, sz, sy, sx))
     if chunks is not None:
         chunk_shape = [tuple(int(v) for v in chunks)] * multiscale_levels
 
@@ -393,7 +452,8 @@ def to_ome_parquet(
         record_dict = data.as_py()
     else:
         # Validate by round-tripping through a typed scalar, then back to dict.
-        record_dict = pa.scalar(data, type=OME_ARROW_STRUCT).as_py()
+        record_dict = {f.name: data.get(f.name) for f in OME_ARROW_STRUCT}
+        record_dict = pa.scalar(record_dict, type=OME_ARROW_STRUCT).as_py()
 
     # 2) Build a single-row struct array from the dict, explicitly passing the schema
     struct_array = pa.array([record_dict], type=OME_ARROW_STRUCT)  # len=1
@@ -456,7 +516,8 @@ def to_ome_vortex(
         record_dict = data.as_py()
     else:
         # Validate by round-tripping through a typed scalar, then back to dict.
-        record_dict = pa.scalar(data, type=OME_ARROW_STRUCT).as_py()
+        record_dict = {f.name: data.get(f.name) for f in OME_ARROW_STRUCT}
+        record_dict = pa.scalar(record_dict, type=OME_ARROW_STRUCT).as_py()
 
     # 2) Build a single-row struct array from the dict, explicitly passing the schema
     struct_array = pa.array([record_dict], type=OME_ARROW_STRUCT)  # len=1

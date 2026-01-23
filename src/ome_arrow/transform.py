@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pyarrow as pa
 
+from ome_arrow.ingest import _build_chunks_from_planes, _normalize_chunk_shape
 from ome_arrow.meta import OME_ARROW_STRUCT
 
 
@@ -178,5 +179,38 @@ def slice_ome_arrow(
     rec_out = dict(row)
     rec_out["pixels_meta"] = pm_out
     rec_out["planes"] = planes_out
+
+    chunk_grid_in = row.get("chunk_grid") or {}
+    if chunk_grid_in or row.get("chunks"):
+        chunk_shape = (
+            int(chunk_grid_in.get("chunk_z", 1)),
+            int(chunk_grid_in.get("chunk_y", 512)),
+            int(chunk_grid_in.get("chunk_x", 512)),
+        )
+        chunk_order = str(chunk_grid_in.get("chunk_order") or "ZYX")
+        chunks_out = _build_chunks_from_planes(
+            planes=planes_out,
+            size_t=new_st,
+            size_c=new_sc,
+            size_z=new_sz,
+            size_y=new_sy,
+            size_x=new_sx,
+            chunk_shape=chunk_shape,
+            chunk_order=chunk_order,
+        )
+        cz, cy, cx = _normalize_chunk_shape(chunk_shape, new_sz, new_sy, new_sx)
+        rec_out["chunk_grid"] = {
+            "order": "TCZYX",
+            "chunk_t": 1,
+            "chunk_c": 1,
+            "chunk_z": cz,
+            "chunk_y": cy,
+            "chunk_x": cx,
+            "chunk_order": chunk_order,
+        }
+        rec_out["chunks"] = chunks_out
+    else:
+        rec_out["chunk_grid"] = row.get("chunk_grid")
+        rec_out["chunks"] = row.get("chunks")
 
     return pa.scalar(rec_out, type=OME_ARROW_STRUCT)

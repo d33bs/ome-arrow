@@ -50,7 +50,7 @@ def _ome_arrow_from_table(
     # 1) Locate the OME-Arrow column
     def _struct_matches_ome_fields(t: pa.StructType) -> bool:
         ome_fields = {f.name for f in OME_ARROW_STRUCT}
-        required_fields = ome_fields - {"image_type"}
+        required_fields = ome_fields - {"image_type", "chunk_grid", "chunks"}
         col_fields = {f.name for f in t}
         return required_fields.issubset(col_fields)
 
@@ -249,6 +249,105 @@ def _read_ngff_scale(zarr_path: Path) -> tuple[float, float, float, str | None] 
     return psize_x, psize_y, psize_z, unit
 
 
+def _normalize_chunk_shape(
+    chunk_shape: Optional[Tuple[int, int, int]],
+    size_z: int,
+    size_y: int,
+    size_x: int,
+) -> Tuple[int, int, int]:
+    """Normalize a chunk shape against image bounds.
+
+    Args:
+        chunk_shape: Desired chunk shape as (Z, Y, X), or None.
+        size_z: Total Z size of the image.
+        size_y: Total Y size of the image.
+        size_x: Total X size of the image.
+
+    Returns:
+        Tuple[int, int, int]: Normalized (Z, Y, X) chunk shape.
+    """
+    if chunk_shape is None:
+        chunk_shape = (1, 512, 512)
+    cz = max(1, min(int(chunk_shape[0]), int(size_z)))
+    cy = max(1, min(int(chunk_shape[1]), int(size_y)))
+    cx = max(1, min(int(chunk_shape[2]), int(size_x)))
+    return cz, cy, cx
+
+
+def _build_chunks_from_planes(
+    *,
+    planes: List[Dict[str, Any]],
+    size_t: int,
+    size_c: int,
+    size_z: int,
+    size_y: int,
+    size_x: int,
+    chunk_shape: Optional[Tuple[int, int, int]],
+    chunk_order: str = "ZYX",
+) -> List[Dict[str, Any]]:
+    """Build chunked pixels from a list of flattened planes.
+
+    Args:
+        planes: List of plane dicts with keys z, t, c, and pixels.
+        size_t: Total T size of the image.
+        size_c: Total C size of the image.
+        size_z: Total Z size of the image.
+        size_y: Total Y size of the image.
+        size_x: Total X size of the image.
+        chunk_shape: Desired chunk shape as (Z, Y, X).
+        chunk_order: Flattening order for chunk pixels (default "ZYX").
+
+    Returns:
+        List[Dict[str, Any]]: Chunk list with pixels stored as flat lists.
+
+    Raises:
+        ValueError: If an unsupported chunk_order is requested.
+    """
+    if str(chunk_order).upper() != "ZYX":
+        raise ValueError("Only chunk_order='ZYX' is supported for now.")
+
+    cz, cy, cx = _normalize_chunk_shape(chunk_shape, size_z, size_y, size_x)
+
+    plane_map: Dict[Tuple[int, int, int], np.ndarray] = {}
+    for p in planes:
+        z = int(p["z"])
+        t = int(p["t"])
+        c = int(p["c"])
+        pix = p["pixels"]
+        arr2d = np.asarray(pix).reshape(size_y, size_x)
+        plane_map[(t, c, z)] = arr2d
+
+    chunks: List[Dict[str, Any]] = []
+    for t in range(size_t):
+        for c in range(size_c):
+            for z0 in range(0, size_z, cz):
+                sz = min(cz, size_z - z0)
+                for y0 in range(0, size_y, cy):
+                    sy = min(cy, size_y - y0)
+                    for x0 in range(0, size_x, cx):
+                        sx = min(cx, size_x - x0)
+                        slab = np.zeros((sz, sy, sx), dtype=np.uint16)
+                        for zi in range(sz):
+                            plane = plane_map.get((t, c, z0 + zi))
+                            if plane is None:
+                                continue
+                            slab[zi] = plane[y0 : y0 + sy, x0 : x0 + sx]
+                        chunks.append(
+                            {
+                                "t": t,
+                                "c": c,
+                                "z": z0,
+                                "y": y0,
+                                "x": x0,
+                                "shape_z": sz,
+                                "shape_y": sy,
+                                "shape_x": sx,
+                                "pixels": slab.reshape(-1).tolist(),
+                            }
+                        )
+    return chunks
+
+
 def to_ome_arrow(
     type_: str = OME_ARROW_TAG_TYPE,
     version: str = OME_ARROW_TAG_VERSION,
@@ -269,6 +368,10 @@ def to_ome_arrow(
     physical_size_unit: str = "µm",
     channels: Optional[List[Dict[str, Any]]] = None,
     planes: Optional[List[Dict[str, Any]]] = None,
+    chunks: Optional[List[Dict[str, Any]]] = None,
+    chunk_shape: Optional[Tuple[int, int, int]] = (1, 512, 512),  # (Z, Y, X)
+    chunk_order: str = "ZYX",
+    build_chunks: bool = True,
     masks: Any = None,
 ) -> pa.StructScalar:
     """
@@ -294,6 +397,12 @@ def to_ome_arrow(
         physical_size_unit: Unit string, default "µm".
         channels: List of channel dicts. Autogenerates one if None.
         planes: List of plane dicts. Empty if None.
+        chunks: Optional list of chunk dicts. If None and build_chunks is True,
+            chunks are derived from planes using chunk_shape.
+        chunk_shape: Chunk shape as (Z, Y, X). Defaults to (1, 512, 512).
+        chunk_order: Flattening order for chunk pixels (default "ZYX").
+        build_chunks: If True, build chunked pixels from planes when chunks
+            is None.
         masks: Optional placeholder for future annotations.
 
     Returns:
@@ -339,6 +448,31 @@ def to_ome_arrow(
     if planes is None:
         planes = [{"z": 0, "t": 0, "c": 0, "pixels": [0] * (size_x * size_y)}]
 
+    if chunks is None and build_chunks:
+        chunks = _build_chunks_from_planes(
+            planes=planes,
+            size_t=size_t,
+            size_c=size_c,
+            size_z=size_z,
+            size_y=size_y,
+            size_x=size_x,
+            chunk_shape=chunk_shape,
+            chunk_order=chunk_order,
+        )
+
+    chunk_grid = None
+    if chunks is not None:
+        cz, cy, cx = _normalize_chunk_shape(chunk_shape, size_z, size_y, size_x)
+        chunk_grid = {
+            "order": "TCZYX",
+            "chunk_t": 1,
+            "chunk_c": 1,
+            "chunk_z": cz,
+            "chunk_y": cy,
+            "chunk_x": cx,
+            "chunk_order": str(chunk_order),
+        }
+
     record = {
         "type": type_,
         "version": version,
@@ -362,6 +496,8 @@ def to_ome_arrow(
             "physical_size_z_unit": physical_size_unit,
             "channels": channels,
         },
+        "chunk_grid": chunk_grid,
+        "chunks": chunks,
         "planes": planes,
         "masks": masks,
     }
@@ -379,6 +515,9 @@ def from_numpy(
     channel_names: Optional[Sequence[str]] = None,
     acquisition_datetime: Optional[datetime] = None,
     clamp_to_uint16: bool = True,
+    chunk_shape: Optional[Tuple[int, int, int]] = (1, 512, 512),
+    chunk_order: str = "ZYX",
+    build_chunks: bool = True,
     # meta
     physical_size_x: float = 1.0,
     physical_size_y: float = 1.0,
@@ -386,44 +525,39 @@ def from_numpy(
     physical_size_unit: str = "µm",
     dtype_meta: Optional[str] = None,  # if None, inferred from output dtype
 ) -> pa.StructScalar:
-    """
-    Build an OME-Arrow StructScalar from a NumPy array.
+    """Build an OME-Arrow StructScalar from a NumPy array.
 
-    Parameters
-    ----------
-    arr : np.ndarray
-        Image data with axes described by `dim_order`.
-    dim_order : str, default "TCZYX"
-        Axis labels for `arr`. Must include "Y" and "X".
-        Supported examples: "YX", "ZYX", "CYX", "CZYX", "TYX", "TCYX", "TCZYX".
-    image_id, name : Optional[str]
-        Identifiers to embed in the record.
-    image_type : Optional[str]
-        Open-ended image kind (e.g., "image", "label").
-    channel_names : Optional[Sequence[str]]
-        Names for channels; defaults to C0..C{n-1}.
-    acquisition_datetime : Optional[datetime]
-        Defaults to now (UTC) if None.
-    clamp_to_uint16 : bool, default True
-        If True, clamp/cast planes to uint16 before serialization.
-    physical_size_x/y/z : float
-        Spatial pixel sizes (µm), Z used if present.
-    physical_size_unit : str
-        Unit string for spatial axes (default "µm").
-    dtype_meta : Optional[str]
-        Pixel dtype string to place in metadata; if None, inferred from the
-        (possibly cast) array's dtype.
+    Args:
+        arr: Image data with axes described by `dim_order`.
+        dim_order: Axis labels for `arr`. Must include "Y" and "X".
+            Supported examples: "YX", "ZYX", "CYX", "CZYX", "TYX", "TCYX", "TCZYX".
+        image_id: Optional stable image identifier.
+        name: Optional human label.
+        image_type: Open-ended image kind (e.g., "image", "label").
+        channel_names: Names for channels; defaults to C0..C{n-1}.
+        acquisition_datetime: Defaults to now (UTC) if None.
+        clamp_to_uint16: If True, clamp/cast planes to uint16 before serialization.
+        chunk_shape: Chunk shape as (Z, Y, X). Defaults to (1, 512, 512).
+        chunk_order: Flattening order for chunk pixels (default "ZYX").
+        build_chunks: If True, build chunked pixels from planes.
+        physical_size_x: Spatial pixel size (µm) for X.
+        physical_size_y: Spatial pixel size (µm) for Y.
+        physical_size_z: Spatial pixel size (µm) for Z when present.
+        physical_size_unit: Unit string for spatial axes (default "µm").
+        dtype_meta: Pixel dtype string to place in metadata; if None, inferred
+            from the (possibly cast) array's dtype.
 
-    Returns
-    -------
-    pa.StructScalar
-        Typed OME-Arrow record (schema = OME_ARROW_STRUCT).
+    Returns:
+        pa.StructScalar: Typed OME-Arrow record (schema = OME_ARROW_STRUCT).
 
-    Notes
-    -----
-    - If Z is not in `dim_order`, `size_z` will be 1 and the meta
-      dimension_order becomes "XYCT"; otherwise "XYZCT".
-    - If T/C are absent in `dim_order`, they default to size 1.
+    Raises:
+        TypeError: If `arr` is not a NumPy ndarray.
+        ValueError: If `dim_order` is invalid or dimensions are non-positive.
+
+    Notes:
+        - If Z is not in `dim_order`, `size_z` will be 1 and the meta
+          dimension_order becomes "XYCT"; otherwise "XYZCT".
+        - If T/C are absent in `dim_order`, they default to size 1.
     """
 
     if not isinstance(arr, np.ndarray):
@@ -526,6 +660,9 @@ def from_numpy(
         physical_size_unit=str(physical_size_unit),
         channels=channels,
         planes=planes,
+        chunk_shape=chunk_shape,
+        chunk_order=chunk_order,
+        build_chunks=build_chunks,
         masks=None,
     )
 

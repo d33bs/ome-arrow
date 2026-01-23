@@ -161,7 +161,8 @@ class OMEArrow:
 
         # --- 5) Plain dict matching the schema -----------------------------------
         elif isinstance(data, dict):
-            self.data = pa.scalar(data, type=OME_ARROW_STRUCT)
+            record = {f.name: data.get(f.name) for f in OME_ARROW_STRUCT}
+            self.data = pa.scalar(record, type=OME_ARROW_STRUCT)
             if image_type is not None:
                 self.data = self._wrap_with_image_type(self.data, image_type)
 
@@ -239,7 +240,8 @@ class OMEArrow:
         compression / compression_level / tile:
             OME-TIFF options (passed through to tifffile via BioIO).
         chunks / zarr_compressor / zarr_level :
-            OME-Zarr options (chunk shape, compressor hint, level).
+            OME-Zarr options (chunk shape, compressor hint, level). If chunks is
+            None, a TCZYX default is chosen (1,1,<=4,<=512,<=512).
         use_channel_colors:
             Try to embed per-channel display colors when safe; otherwise omitted.
         parquet_*:
